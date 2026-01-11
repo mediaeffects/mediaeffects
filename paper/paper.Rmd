@@ -1,0 +1,971 @@
+---
+title: "mediaeffects: Modern R tools for understanding media effects"
+tags:
+  - R
+  - media effects
+  - heterogeneity
+  - causal forests
+  - machine learning
+authors:
+  - name: Saurabh Khanna
+    orcid: 0000-0002-9346-4896
+    affiliation: 1
+  - name: Jochen Peter
+    orcid: 0000-0002-2356-6619
+    affiliation: 1
+affiliations:
+ - name: Amsterdam School of Communication Research, University of Amsterdam
+   index: 1
+citation_author: Khanna and Peter
+date: 12 January 2026
+year: 2026
+bibliography: references.bib
+output: rticles::joss_article
+csl: apa.csl
+journal: JOSS
+header-includes: 
+  - \newcounter{none}
+  - \providecommand{\pandocbounded}[1]{#1}
+  - \usepackage{bookmark}
+  - \hypersetup{bookmarks=true, bookmarksnumbered=true, bookmarksopen=true, bookmarksdepth=3}
+---
+
+```{r setup, include=FALSE}
+# knitr options for document rendering
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  message = FALSE, 
+  warning = FALSE,
+  fig.width = 7,         # Default figure width
+  fig.height = 5         # Default figure height
+)
+
+# Set width for code output to prevent lines from running off the page
+options(width = 60)
+```
+
+```{r load-libraries, message=FALSE, warning=FALSE, echo=FALSE}
+# Load required libraries
+# Core analysis: grf (causal forests), estimatr (robust regression), texreg (tables)
+# Data handling: tidyverse, haven, gssr, gssrdoc, janitor
+# Data exploration: skimr, corrr
+pacman::p_load(
+  tidyverse,   # Data manipulation and visualization
+  grf,         # Causal forest implementation
+  haven,       # Import GSS data
+  estimatr,    # Robust regression models
+  texreg,      # Regression table formatting
+  skimr,       # Data summaries
+  gssr,        # GSS data access
+  gssrdoc,     # GSS documentation
+  janitor,     # Data cleaning utilities
+  corrr        # Correlation analysis
+)
+```
+
+```{r define-functions}
+# ============================================================================
+# MEDIAEFFECTS PACKAGE FUNCTIONS
+# ============================================================================
+# This section defines the core functions for exploring heterogeneous 
+# treatment effects using causal forests
+
+# ----------------------------------------------------------------------------
+# Function 1: Test for heterogeneity using RATE
+# ----------------------------------------------------------------------------
+# Tests whether treatment effects vary across individuals using the Rank
+# Average Treatment Effect (RATE) method. Returns AUTOC (Area Under the
+# Targeting Operator Characteristic) - values > 0 indicate heterogeneity.
+#
+# Arguments:
+#   Y: Outcome variable (numeric vector)
+#   W: Treatment variable (binary: 0/1)
+#   X: Covariate matrix (data frame or matrix)
+#   weights: Optional survey weights (numeric vector)
+#   seed: Random seed for reproducibility
+#
+# Returns: List with RATE object, AUTOC estimate, standard error, and CIs
+test_heterogeneity <- function(Y, W, X, weights = NULL, seed = 27011990) {
+  set.seed(seed)
+  n <- length(Y)
+  
+  # Split data for training and evaluation
+  train_idx <- sample(1:n, n / 2)
+  
+  # Train forest on training set
+  train_forest <- causal_forest(
+    X[train_idx, ], 
+    Y[train_idx], 
+    W[train_idx], 
+    sample.weights = if (!is.null(weights)) weights[train_idx] else NULL
+  )
+  
+  # Evaluation forest on evaluation set
+  eval_forest <- causal_forest(
+    X[-train_idx, ], 
+    Y[-train_idx], 
+    W[-train_idx], 
+    sample.weights = if (!is.null(weights)) weights[-train_idx] else NULL
+  )
+  
+  # Get CATE predictions for evaluation set based on training forest
+  cate_estimates_for_eval <- predict(train_forest, X[-train_idx, ])$predictions
+  
+  # Calculate AUTOC
+  rate <- rank_average_treatment_effect(eval_forest, cate_estimates_for_eval)
+  
+  # Return results
+  list(
+    rate = rate,
+    autoc = rate$estimate,
+    std_err = rate$std.err,
+    ci_lower = rate$estimate - 1.96 * rate$std.err,
+    ci_upper = rate$estimate + 1.96 * rate$std.err,
+    train_forest = train_forest,
+    eval_forest = eval_forest
+  )
+}
+
+# ----------------------------------------------------------------------------
+# Function 2: Estimate CATEs for all observations
+# ----------------------------------------------------------------------------
+# Estimates Conditional Average Treatment Effects (CATEs) for each individual
+# using a causal forest. Returns individual-level treatment effect estimates
+# along with uncertainty measures.
+#
+# Arguments:
+#   Y: Outcome variable (numeric vector)
+#   W: Treatment variable (binary: 0/1)
+#   X: Covariate matrix (data frame or matrix)
+#   ids: Optional ID vector for observations
+#   weights: Optional survey weights (numeric vector)
+#   num_trees: Number of trees in the causal forest (default: 2000)
+#   seed: Random seed for reproducibility
+#
+# Returns: List with causal forest object, CATE dataframe, ATE, and ATE SE
+estimate_cates <- function(Y, W, X, ids = NULL, weights = NULL, 
+                          num_trees = 2000, seed = 27011990) {
+  set.seed(seed)
+  
+  # Train causal forest
+  cf <- causal_forest(
+    X, Y, W,
+    num.trees = num_trees,
+    honesty = TRUE,
+    seed = seed,
+    sample.weights = weights,
+    tune.parameters = "all"
+  )
+  
+  # Get predictions
+  predictions <- predict(cf, estimate.variance = TRUE)
+  
+  # Calculate ATE
+  ate <- average_treatment_effect(cf, target.sample = "all")
+  
+  # Build results dataframe
+  df_cate <- tibble(
+    treatment_effect = predictions$predictions,
+    standard_error = sqrt(predictions$variance.estimates),
+    ci_lower = treatment_effect - 1.96 * standard_error,
+    ci_upper = treatment_effect + 1.96 * standard_error,
+    quintile = ntile(treatment_effect, 5)
+  )
+  
+  # Add IDs if provided
+  if (!is.null(ids)) {
+    df_cate <- df_cate %>% mutate(id = ids, .before = 1)
+  }
+  
+  # Return results
+  list(
+    causal_forest = cf,
+    cates = df_cate,
+    ate = ate[1],
+    ate_se = ate[2]
+  )
+}
+
+# ----------------------------------------------------------------------------
+# Function 3: Identify most important moderators
+# ----------------------------------------------------------------------------
+# Calculates variable importance scores to identify which covariates drive
+# heterogeneity in treatment effects.
+#
+# Arguments:
+#   causal_forest: Fitted causal forest object from estimate_cates()
+#   X: Covariate matrix used in fitting the forest
+#   top_n: Optional number of top variables to return (NULL = all)
+#
+# Returns: List with variable importance dataframe and ranked variable names
+identify_moderators <- function(causal_forest, X, top_n = NULL) {
+  # Calculate variable importance
+  varimp <- variable_importance(causal_forest)
+  
+  # Rank variables
+  ranked_vars <- order(varimp, decreasing = TRUE)
+  
+  # Create results dataframe
+  df_varimp <- tibble(
+    variable = colnames(X)[ranked_vars],
+    importance = varimp[ranked_vars],
+    rank = 1:length(varimp)
+  )
+  
+  # Filter to top_n if specified
+  if (!is.null(top_n)) {
+    df_varimp <- df_varimp %>% slice(1:top_n)
+  }
+  
+  list(
+    variable_importance = df_varimp,
+    ranked_vars = ranked_vars,
+    top_variables = df_varimp$variable
+  )
+}
+
+# ----------------------------------------------------------------------------
+# Function 4: Identify highly correlated variables
+# ----------------------------------------------------------------------------
+# Finds pairs of variables with correlations above a threshold. Useful for
+# pre-analysis checks to avoid collinearity issues.
+#
+# Arguments:
+#   data: Dataframe containing numeric variables
+#   threshold: Minimum absolute correlation to report (default: 0.7)
+#
+# Returns: Tibble with variable pairs and their correlations
+highly_correlated <- function(data, threshold = 0.7) {
+  data %>%
+    select(where(is.numeric)) %>%
+    correlate() %>%
+    shave() %>%
+    stretch(na.rm = TRUE) %>%
+    filter(abs(r) >= threshold) %>%
+    arrange(desc(abs(r)))
+}
+
+# ----------------------------------------------------------------------------
+# Function 5: Plot treatment effect histogram by quintile
+# ----------------------------------------------------------------------------
+# Creates a histogram showing the distribution of individual treatment effects,
+# colored by quintile, with ATE shown as a dashed vertical line.
+#
+# Arguments:
+#   df_cate: Dataframe with treatment_effect and quintile columns
+#   ate: Average treatment effect value for reference line (optional)
+#
+# Returns: ggplot object
+plot_treatment_effect_histogram <- function(df_cate, ate = NULL) {
+  p <- ggplot(df_cate, aes(x = treatment_effect, fill = factor(quintile))) +
+    geom_histogram(
+      color = "white",
+      bins  = 30
+    ) +
+    scale_fill_brewer(
+      palette = "Spectral", 
+      name    = "Quintile\n(1 = lowest, 5 = highest)"
+    ) +
+    theme_bw() +
+    theme(legend.position = "bottom") +
+    labs(
+      x = "Individual Treatment Effect",
+      y = "Count",
+      title = "Distribution of effects by Quintile"
+    )
+  
+  # Add ATE reference line if provided
+  if (!is.null(ate)) {
+    p <- p + geom_vline(xintercept = ate, linetype = "dashed")
+  }
+  
+  return(p)
+}
+
+# ----------------------------------------------------------------------------
+# Function 6: Plot treatment effect violin plot by quintile
+# ----------------------------------------------------------------------------
+# Creates violin plots showing the distribution of treatment effects within
+# each quintile, with ATE shown as a horizontal dashed line.
+#
+# Arguments:
+#   df_cate: Dataframe with treatment_effect and quintile columns
+#   ate: Average treatment effect value for reference line
+#
+# Returns: ggplot object
+plot_treatment_effect_violin <- function(df_cate, ate = NULL) {
+  p <- ggplot(df_cate, aes(x = factor(quintile), y = treatment_effect, fill = factor(quintile))) +
+    geom_violin() +
+    theme_bw() +
+    scale_fill_brewer(
+      palette = "Spectral", 
+      name    = "Quintile\n(1 = lowest, 5 = highest)"
+    ) +
+    labs(x = "Quintile", y = "Effect size",
+         title = "Distribution of Treatment Effects by Quintile")
+  
+  # Add ATE reference line if provided
+  if (!is.null(ate)) {
+    p <- p + geom_hline(yintercept = ate, linetype = "dashed")
+  }
+  
+  return(p)
+}
+
+# ----------------------------------------------------------------------------
+# Function 7: Plot moderator heatmap across quintiles
+# ----------------------------------------------------------------------------
+# Creates a heatmap showing standardized mean values of top moderators across
+# treatment effect quintiles. Helps visualize which characteristics are
+# associated with larger or smaller treatment effects.
+#
+# Arguments:
+#   df_cate: Dataframe with quintile column and moderator variables
+#   top_variables: Character vector of variable names to include
+#
+# Returns: ggplot object
+plot_moderator_heatmap <- function(df_cate, top_variables) {
+  df_cate %>%
+    group_by(quintile) %>%
+    summarise_at(
+      vars(all_of(top_variables)),
+      ~ mean(., na.rm = T),
+    ) %>%
+    mutate_at(vars(-quintile), ~ scale(.) %>% as.vector) %>%
+    pivot_longer(-quintile, names_to = "variable", values_to = "value") %>%
+    mutate(
+      variable = factor(variable, levels = rev(top_variables)),
+      quintile_label = factor(quintile, 
+                              levels = 1:5, 
+                              labels = c("1\n(Lowest)", "2", "3", "4", "5\n(Highest)"))
+    ) %>%
+    ggplot(aes(x = quintile_label, y = variable, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = round(value, 2)), size = 3, color = "black") +
+    scale_fill_gradient2(low = "#d73027", mid = "#ffffbf", high = "#1a9850", 
+                         midpoint = 0, name = "Standardized\nmean") +
+    labs(
+      x = "Effect size quintile", 
+      y = NULL,
+      title = "Heterogeneity in conservatives support for Donald Trump"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "right",
+      panel.grid = element_blank(),
+      axis.text.y = element_text(size = 10)
+    )
+}
+```
+
+
+# Introduction
+
+Media effects research has traditionally focused on estimating average treatment effects (ATEs) of media exposure on various outcomes. However, there is growing recognition that, more often than not, these effects may not be uniform across all individuals. Understanding heterogeneity in media effects is crucial for tailoring interventions and policies to specific sub-populations. Modern machine learning (ML) techniques, particularly causal forests, offer powerful tools to explore and estimate heterogeneous treatment effects (HTEs) in observational data. Causal forests extend traditional random forests by focusing on estimating conditional average treatment effects (CATEs) while accounting for confounding variables.
+
+We define heterogeneity in media effects as the variation in the effect of media exposure on an outcome across different individuals or subgroups, influenced by their unique characteristics or contexts. This paper introduces the `mediaeffects` R package, which implements the causal forest algorithm, tailored to data distributions prevalent in communication research, to explore heterogeneity in media effects. We provide an illustrative example using data from the 2024 General Social Survey to demonstrate how researchers can leverage this package to uncover nuanced insights into media effects.
+
+# Current approach to exploring heterogeneity
+
+Researchers have traditionally used two approaches to explore heterogeneity in media effects.
+
+## Subgroup analyses
+
+The first approach consists of splitting the sample into subgroups based on certain participant characteristics (such as, age, gender, education level) or media characteristics (such as, type of media content, frequency of exposure), and estimating the treatment effect separately within each subgroup. This approach allows researchers to identify whether the media effect varies across different segments of the population. Let us take the example of exploring heterogeneity in the effect of watching conservative news channels on support for Donald Trump. Researchers may split the sample into age groups (e.g., younger vs. older adults) and estimate the effect of watching conservative news channels on Trump support within each age group separately. If the effect is significantly stronger among older adults compared to younger adults, this would suggest heterogeneity in the media effect based on age.
+
+Mathematically, this can be represented as:
+
+\[
+\begin{aligned}
+Y_i = \beta_0 + \beta_1 \cdot Treatment_i + \epsilon_i
+\end{aligned}
+\]
+
+where $Y_i$ is the rating of Trump for individual $i$, and $Treatment_i$ indicates exposure to conservative news.
+
+for each subgroup \(g\):
+
+\[
+\begin{aligned}
+Y_{i,g} = \beta_{0,g} + \beta_{1,g} \cdot Treatment_{i,g} + \epsilon_{i,g}
+\end{aligned}
+\]
+
+where \(\beta_{1,g}\) represents the effect of watching conservative news channels on Trump support within subgroup \(g\). By comparing \(\beta_{1,g}\) across different subgroups, researchers can assess whether there is heterogeneity in the media effect.
+
+## Linear regression based interactions
+
+The second approach involves incorporating interaction terms into linear regression models. By including interactions between the treatment variable (media exposure) and potential moderators (participant or media characteristics), researchers can assess whether the effect of media exposure on the outcome differs based on these moderators. Picking up on our example, researchers may include an interaction term between watching conservative news channels and age in a regression model predicting Trump support. A significant interaction term would indicate that the effect of watching conservative news channels on Trump support varies by age.
+
+Mathematically, this can be represented as:
+
+\[
+\begin{aligned}
+Y_i = \beta_0 &+ \beta_1 W_i + \beta_2 X_i \\
+&+ \beta_3 (W_i \times X_i) + \epsilon_i
+\end{aligned}
+\]
+
+where $W_i$ is the treatment (conservative news exposure), $X_i$ is the moderator (age), and their interaction $W_i \times X_i$ tests for heterogeneity.
+
+where \(\beta_3\) captures the heterogeneity in the media effect based on age. The significance and magnitude of \(\beta_3\) indicate whether and how the effect of watching conservative news channels on Trump support varies with age.
+
+## Limitations
+
+<!-- Paragraph 1 (Pre-specification): Researchers must specify moderators before analysis, which pro- -->
+<!-- tects against data-driven false positives but risks missing important moderators that theory did not -->
+<!-- anticipate. -->
+<!-- Paragraph 2 (Multiple comparisons): Testing many moderators at α = .05 inflates false positive -->
+<!-- rates (e.g., 40% chance of one spurious significant result when testing 10 moderators). Researchers -->
+<!-- face a tradeoff between examining few moderators (missing discoveries) or many (false positives or -->
+<!-- reduced power after corrections). -->
+<!-- Paragraph 3 (Linearity assumption): The interaction term W × X assumes treatment effects change -->
+<!-- linearly with moderator values. Nonlinear patterns (e.g., effects only at extreme moderator levels) -->
+<!-- cannot be captured. -->
+<!-- Paragraph 4 (Average effects only): Traditional approaches estimate group-level averages rather than -->
+<!-- individual-level effects, limiting precision in understanding who is most affected. -->
+<!-- Paragraph 5 (No heterogeneity test): There is no formal test for whether heterogeneity exists inde- -->
+<!-- pendent of whether specific hypothesized moderators are significant. -->
+
+While these traditional approaches have been widely used, they come with several limitations. First, they require researchers to pre-specify potential moderators based on theory or prior research, which may lead to overlooking important moderators that were not anticipated. Second, testing multiple moderators increases the risk of false positives due to multiple comparisons, making it challenging to balance between exploring many moderators and maintaining statistical power. Third, linear regression-based interactions assume a linear relationship between the moderator and treatment effect, which may not capture more complex, nonlinear patterns of heterogeneity. Fourth, these approaches typically estimate average effects within subgroups rather than individual-level treatment effects, limiting the precision of understanding who is most affected by media exposure. Finally, there is no formal statistical test for the presence of heterogeneity itself, independent of specific hypothesized moderators.
+
+# Modern ML based approaches
+
+Recent advances in machine learning (ML) have introduced new methods for exploring heterogeneity in treatment effects. Causal forests, an extension of random forests, have emerged as a powerful tool for estimating conditional average treatment effects (CATEs) while accounting for confounding variables. Unlike traditional approaches, causal forests do not require pre-specification of moderated relationships, and can automatically identify complex interactions and nonlinear relationships in the data. This allows researchers to uncover nuanced patterns of heterogeneity that may be missed by traditional methods.
+
+## Conceptual foundations
+
+In order to understand causal forests, it is important to first understand decision trees and random forests. We will briefly review these concepts below.
+
+## Decision trees
+
+<!-- accessible explanation for a total beginner with no idea of ML concepts -->
+
+A decision tree is a simple yet powerful machine learning algorithm used for both classification and regression tasks. It works by recursively splitting the data into subsets based on the values of input features, creating a tree-like structure where each internal node represents a decision based on a feature, each branch represents the outcome of that decision, and each leaf node represents a final prediction or outcome.
+
+Using our example of exploring heterogeneity in the effect of watching conservative news channels on support for Donald Trump, a decision tree would start with the entire dataset and look for the feature (e.g., age, education level, political ideology) that best splits the data into two groups that are most different in terms of Trump support. This process is repeated recursively for each subgroup until a stopping criterion is met (e.g., minimum number of observations in a leaf node).
+
+Mathematically, a decision tree can be represented as a series of binary splits based on feature values. For example, the first split might be based on age:
+
+\[ \text{If } age < 40 \text{ then go to left subtree else go to right subtree} \]
+
+Each subsequent split would further divide the data based on other features, ultimately leading to leaf nodes that provide predictions for Trump support based on the characteristics of individuals in that leaf.
+
+## Random forests
+
+A random forest is an ensemble learning method that combines multiple decision trees to improve predictive accuracy and reduce overfitting. In a random forest, a large number of decision trees are trained on different subsets of the data (using bootstrapping) and different subsets of features (using random feature selection). The final prediction is made by aggregating the predictions from all individual trees, typically through majority voting for classification tasks or averaging for regression tasks. 
+
+Using our example, a random forest would create multiple decision trees, each trained on a different random sample of the data and using different random subsets of features. Each tree would make its own prediction for Trump support based on the characteristics of individuals. The final prediction for each individual would be the average of the predictions from all trees in the forest. 
+
+Mathematically, the prediction from a random forest can be represented as:
+\[ \hat{y}_i = \frac{1}{T} \sum_{t=1}^{T} \hat{y}_{i}^{(t)} \]
+
+where \( \hat{y}_i \) is the final prediction for individual \(i\), \(T\) is the total number of trees in the forest, and \( \hat{y}_{i}^{(t)} \) is the prediction from tree \(t\) for individual \(i\).
+
+## Causal forests
+
+Causal forests extend the random forest framework to estimate heterogeneous treatment effects (HTEs) by focusing on the conditional average treatment effect (CATE) for each individual, rather than just predicting outcomes. Causal forests are designed to handle observational data where treatment assignment may be confounded by other variables. They achieve this by using a two-stage approach: first, they estimate the propensity score (the probability of receiving treatment given covariates), and then they use this information to adjust the splits in the decision trees to focus on estimating treatment effects.
+
+Using our example, a causal forest would create multiple decision trees that are specifically designed to estimate the effect of watching conservative news channels on Trump support, while accounting for confounding variables such as age, education level, and political ideology. Each tree would estimate the treatment effect for individuals based on their characteristics, and the final CATE for each individual would be obtained by averaging the treatment effect estimates from all trees in the forest.
+
+Mathematically, the CATE for individual \(i\) can be represented as:
+
+\[ \hat{\tau}(X_i) = \frac{1}{T} \sum_{t=1}^{T} \hat{\tau}^{(t)}(X_i) \]
+
+where \( \hat{\tau}(X_i) \) is the estimated CATE for individual \(i\), \(T\) is the total number of trees in the causal forest, and \( \hat{\tau}^{(t)}(X_i) \) is the treatment effect estimate from tree \(t\) for individual \(i\).
+
+# Illustrative example using `mediaeffects` R package
+
+We use the 2024 General Social Survey (GSS) data with a searchable codebook [here](https://gssdataexplorer.norc.org/variables/vfilter). We focus on exploring heterogeneity in the effect of conservatism on support for Donald Trump, controlling for a wide range of demographic, socioeconomic, and attitudinal covariates. 
+
+```{r load-data, include=FALSE}
+# ============================================================================
+# DATA LOADING AND PREPROCESSING
+# ============================================================================
+
+# Load GSS 2024 data and perform initial cleaning
+df <-
+  gss_get_yr(2024) %>%
+  remove_empty() %>% 
+  remove_constant()
+
+# Select variables with at least 75% complete cases
+selected_vars <- 
+  df %>% 
+  mutate(across(everything(), as.numeric)) %>%
+  mutate(across(everything(), ~if_else(. < 0, NA_real_, .))) %>%
+  skim() %>% 
+  as_tibble() %>% 
+  filter(complete_rate >= 0.75) %>% 
+  select(skim_variable) %>% 
+  arrange(skim_variable) %>% 
+  pull()
+
+# Add these in as needed, have more missingness so not added by default
+comm_vars_additional <- c(
+  # media use & exposure
+  "news", "tvhours", "xmovie", "xmoviey", "webmob", "broadband", "mobiledata",
+  
+  # internet use (issp digital societies)
+  "intrnetuse", "inthome", "intprfssnl", "intpub", "intcomm", "intnews", 
+  "intsearch", "intshare", "intstream", "intgame", "intfncl",
+  
+  # digital literacy & skills
+  "intskill", "intsurf", "intapps", "intliteracy", "intcnfrm",
+  
+  # online political communication
+  "inttrig", "intviews", "intoppo", "intpolview", "polnews", "polnewsfrom",
+  
+  # trust & social effects online
+  "intrust", "intmeet", "intlnly", "inthrss", "intscam",
+  
+  # digital proxy use
+  "intbhlf", "intaccprxy", "prxyuse", "ftruse",
+  
+  # non-use reasons
+  "nouseint1", "nouseint2", "nouseint3", "nouseint4", "nouseint5", "nouseint6",
+  "nouseint7", "nouseint8", "nouseint9", "nouseint10", "nouseint11", "nouseint12",
+  
+  # digital detox
+  "unplug", "unplgrsn",
+  
+  # news source reliability
+  "tvnews1", "webnews", "radionews", "papernews", "smnews", "biasnews",
+  
+  # confidence in media
+  "conpress", "contv",
+  
+  # technology attitudes
+  "harmgood1", "techesy", "aiworry", "aidrive", "aimed", "nextgen1",
+  
+  # data privacy & surveillance
+  "dataprot", "emonitor1", "infodeal", "infoprofit", "cctv",
+  
+  # digital divide
+  "agetech", "classtech", "eductech", "gendtech", "urbantech",
+  
+  # free speech & censorship
+  "spkath", "spkathy", "colath", "libath", "libathy", "spkrac", "spkracy", 
+  "colrac", "librac", "libracy", "spkcom", "spkcomy", "colcom", "colcomy", 
+  "libcom", "libcomy", "spkmslm", "spkmslmy", "colmslm", "libmslm", "libmslmy", 
+  "pornlaw",
+  
+  # general trust
+  "trust", "trustv", "trustnv", "trppl", "helpful", "helpfulv", "helpfulnv",
+  "fair", "fairv", "fairnv", "befair",
+  
+  # confidence in institutions
+  "consci", "coneduc", "confed", "conlegis", "conjudge",
+  
+  # political communication
+  "polint", "polviews", "partyid", "pres16", "pres20", "poleff11", "poleff18", 
+  "leftrght", "leftrght1",
+  
+  # political participation
+  "modelobby", "modepet", "modeprot", "modeorg", "modeorgprot", "watchgov",
+  
+  # social contact
+  "socrel", "socfrend", "socommun", "socbar",
+  
+  # cultural/media
+  "amtv", "smedia", "violtv"
+)
+
+# Keep only selected variables
+df <- df %>% select(all_of(selected_vars))
+
+# ----------------------------------------------------------------------------
+# Data cleaning pipeline for causal forest analysis
+# ----------------------------------------------------------------------------
+# Steps:
+# 1. Convert all variables to numeric
+# 2. Replace GSS missing codes with NA
+# 3. Recode variables for intuitive interpretation (higher = more/better)
+# 4. Impute missing values (median for continuous, mode for categorical)
+# 5. Create derived variables
+
+# Helper function: Mode imputation for categorical variables
+get_mode <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+df_clean <- 
+  df %>%
+  
+  # Step 1: Convert all haven-labelled columns to plain numeric
+  mutate(across(everything(), as.numeric)) %>%
+  
+  # Step 2: Replace ALL GSS missing value codes with NA
+  # GSS codes: -100 (IAP), -99 (NA), -98 (DK), -97 (skipped), -96, -95, -94, -93, -90, -80, -70, -60
+  mutate(across(everything(), ~if_else(. < 0, NA_real_, .))) %>%
+  
+  # Step 3: Recode specific variables for intuitive direction (higher = "more"/"better")
+  mutate(
+    # Wellbeing/satisfaction: reverse so higher = better
+    happy = 4 - happy,
+    health = 5 - health,
+    satfin = 4 - satfin,
+    satdemoc = 5 - satdemoc,
+    econstat = 6 - econstat,
+    
+    # Financial trajectory: recode so 3=better, 2=same, 1=worse
+    finalter = case_when(
+      finalter == 1 ~ 3,
+      finalter == 2 ~ 1,
+      finalter == 3 ~ 2,
+      TRUE ~ NA_real_
+    ),
+    
+    # Interest/engagement: reverse so higher = more
+    polintrst = 4 - polintrst,
+    relpersn = 5 - relpersn,
+    sprtprsn = 5 - sprtprsn,
+    svyenjoy = 6 - svyenjoy,
+    svyid1 = 5 - svyid1,
+    svyid2 = 5 - svyid2,
+    lkelyvot = 6 - lkelyvot,
+    fund = 4 - fund,
+    fund16 = 4 - fund16,
+    pray = 6 - pray,
+    xnorcsiz = 11 - xnorcsiz,
+    
+    # Perceived discrimination: reverse so higher = more perceived
+    discaff = 4 - discaff,
+    
+    # Binary yes/no: recode to 1=Yes, 0=No
+    born = if_else(born == 1, 1, 0),
+    maborn = if_else(maborn == 1, 1, 0),
+    paborn = if_else(paborn == 1, 1, 0),
+    compuse = if_else(compuse == 1, 1, 0),
+    othlang = if_else(othlang == 1, 1, 0),
+    reborn = if_else(reborn == 1, 1, 0),
+    raclive = if_else(raclive == 1, 1, 0) %>% replace_na(0),
+    pawrkgrw = if_else(pawrkgrw == 1, 1, 0),
+    mawrkgrw = if_else(mawrkgrw == 1, 1, 0),
+    wrkslf = if_else(wrkslf == 1, 1, 0),
+    wrkgovt1 = if_else(wrkgovt1 == 1, 1, 0),
+    wrkgovt2 = if_else(wrkgovt2 == 1, 1, 0),
+    diagnosd = if_else(diagnosd == 1, 1, 0),
+    dipged = if_else(dipged == 1, 1, 0),
+    
+    
+    # Sex: recode to 0=male, 1=female
+    female = if_else(sex == 2, 1, 0) %>% replace_na(0),
+    sexbirth1 = if_else(sexbirth1 == 2, 1, 0),
+    
+    vetyears = if_else(vetyears == 4, NA_real_, vetyears),
+    vote16 = if_else(vote16 == 1, 1, 0) %>% replace_na(0),
+    vote20 = if_else(vote20 == 1, 1, 0) %>% replace_na(0),
+  ) %>%
+  
+  # Step 4: Impute missing values
+  # Median for continuous variables (>10 unique values)
+  # Mode for categorical variables (<=10 unique values)
+  mutate(across(
+    everything(),
+    ~{
+      if (sum(is.na(.)) == 0) {
+        .
+      } else if (n_distinct(., na.rm = TRUE) > 10) {
+        replace_na(., median(., na.rm = TRUE))
+      } else {
+        replace_na(., get_mode(.))
+      }
+    }
+  )) %>% 
+  mutate(
+    # custom mutations
+    attend_college = if_else(degree >= 2, 1, 0) %>% replace_na(0),
+    mother_college = if_else(madeg >= 2, 1, 0) %>% replace_na(0),
+    father_college = if_else(padeg >= 2, 1, 0) %>% replace_na(0),
+    # polarization = if_else(polviews <= 2 | polviews >= 6, 1, 0) %>% replace_na(0),
+    polarization = abs(polviews - 4) %>% replace_na(0),
+    conservative = if_else(polviews > 4, 1, 0) %>% replace_na(0),
+    hispanic = if_else(hispanic == 1, 0, 1) %>% replace_na(0),
+    live_with_own_parents_16 = if_else(family16 == 1, 1, 0) %>% replace_na(1),
+    married = if_else(marital == 1, 1, 0) %>% replace_na(0),
+    widowed = if_else(marital == 2, 1, 0) %>% replace_na(0),
+    divorced = if_else(marital == 3, 1, 0) %>% replace_na(0),
+    separated = if_else(marital == 4, 1, 0) %>% replace_na(0),
+    cohabitating = if_else(marcohab == 2, 1, 0) %>% replace_na(0),
+    parents_born_us = if_else(parborn == 0, 1, 0) %>% replace_na(1),
+    partyid = if_else(partyid == 7, 3, partyid) %>% replace_na(3),
+    has_cellphone = if_else(phone == 6, 1, 0) %>% replace_na(1),
+    northeast = if_else(region == 1, 1, 0) %>% replace_na(0),
+    midwest = if_else(region == 2, 1, 0) %>% replace_na(0),
+    south = if_else(region == 3, 1, 0) %>% replace_na(0),
+    west = if_else(region == 4, 1, 0) %>% replace_na(0),
+    protestant = if_else(relig == 1, 1, 0) %>% replace_na(0),
+    catholic = if_else(relig == 2, 1, 0) %>% replace_na(0),
+    atheist = if_else(relig == 4, 1, 0) %>% replace_na(0),
+    protestant16 = if_else(relig16 == 1, 1, 0) %>% replace_na(0),
+    catholic16 = if_else(relig16 == 2, 1, 0) %>% replace_na(0),
+    atheist16 = if_else(relig16 == 4, 1, 0) %>% replace_na(0),
+    rural = if_else(res16 <= 3, 1, 0) %>% replace_na(0),
+    lgbt = if_else(sexornt == 1, 1, 0) %>% replace_na(0),
+    heterosexual = if_else(sexornt == 3, 1, 0) %>% replace_na(0),
+    vote_future_rep = if_else(whovotets == 1, 1, 0) %>% replace_na(0),
+    vote_future_dem = if_else(whovotets == 2, 1, 0) %>% replace_na(0),
+    vote_future_indep = if_else(whovotets == 3, 1, 0) %>% replace_na(0),
+    vote_future_abstain = if_else(whovotets == 4, 1, 0) %>% replace_na(0),
+    work_fulltime = if_else(wrkstat == 1, 1, 0) %>% replace_na(0),
+    work_parttime = if_else(wrkstat == 2, 1, 0) %>% replace_na(0),
+    work_unemployed = if_else(wrkstat == 4, 1, 0) %>% replace_na(0),
+    work_retired = if_else(wrkstat == 5, 1, 0) %>% replace_na(0),
+    attending_school = if_else(wrkstat == 6, 1, 0) %>% replace_na(0),
+    homemaker = if_else(wrkstat == 7, 1, 0) %>% replace_na(0),
+  ) %>%
+  rename(rightwing = leftrght, anti_immigrant = letin1a, republican = partyid, rating_trump = ratechall124, rating_harris = ratechall224, rating_biden = rateincumb24, govt_job = wrkgovt1, private_job = wrkgovt2, self_employed = wrkslf, domicile_size = xnorcsiz, white = raceacs1, black = raceacs2) %>%
+  select(-sex, -sexbirth1, -sexnow2, -family16, -ethnic, -income, -indus10, -issp, -marital, -marcohab, -occ10, -parborn, -phone, -race, -racecen1, -racerank1, -ratechall324, -ratechall1ts, -ratechall2ts, -ratechall3ts, -rateincumbts, -reg16, -region, -relig, -relig16, -reltrad, -res16, -sexornt, -subsamprate, -whovotets, -wrkstat) %>%
+  relocate(id, wtssps) %>%
+  arrange(id)
+
+# Remove administrative and non-substantive variables
+exclude_vars <- c(
+  "wtssnrps", "vpsu", "sampcode", 
+  "dateintv", "phase", "kish",
+  "ballot", "form", "modesequence", "spaneng", "mode",
+  "svyenjoy", "svyid1", "svyid2"
+)
+
+df_clean <-
+  df_clean %>%
+  select(-all_of(exclude_vars))
+
+rm(df)
+```
+
+
+## Exploration phase
+
+### Pre-analysis checks
+
+Before running the causal forest, it is important to check for high correlations among covariates, as highly correlated variables can lead to instability in the estimates. We identify pairs of variables with high correlations (e.g., |r| >= 0.7).
+
+```{r check-correlations, echo=TRUE}
+# Check for highly correlated covariates (|r| >= 0.7)
+highly_correlated(df_clean, threshold = 0.7)
+```
+
+
+We define our outcome variable (Y) as the rating of Donald Trump, our treatment variable (W) as conservatism, and our covariate matrix (X) by selecting relevant demographic, socioeconomic, and attitudinal variables from the cleaned dataset.
+
+```{r define-variables, echo=TRUE}
+# Define outcome (Y), treatment (W), and covariates (X) for causal forest
+# Y: Rating of Donald Trump (0-100 scale)
+# W: Conservative ideology (binary: 1 = conservative, 0 = not conservative)
+# X: Demographic, socioeconomic, and attitudinal covariates
+
+Y <- df_clean$rating_trump
+W <- df_clean$conservative
+X <- 
+  df_clean %>%
+  select(all_of(c(
+    # Demographics
+    "female", "white", "black", "hispanic", "age", "lgbt",
+    # Socioeconomic
+    "educ", "income16", "madeg", "padeg", "prestg10",
+    # Family & household
+    "married", "adults", "childs",
+    # Geographic & background
+    "rural", "midwest", "mobile16", "born",
+    # Religion & engagement
+    "attend", "pray",
+    # Attitudes & behaviors
+    "lkelyvot", "compuse", "othlang", "diagnosd",
+    "raclive", "vetyears",
+    # Wellbeing
+    "happy", "health", "finalter", "satfin", "satdemoc"
+  )))
+```
+
+Now that we have defined our variables, we can proceed to estimate heterogeneity in the effect of conservatism on Trump ratings using causal forests [@wager2018estimation].
+
+
+### Step 1: Does heterogeneity exist?
+
+We can start by testing for the presence of heterogeneity in the treatment effect using the RATE (Ranked Average Treatment Effect) method. The method works by ranking individuals based on their estimated treatment effects and then calculating the average treatment effect for different quantiles of this ranking. If the treatment effect varies significantly across these quantiles, it indicates the presence of heterogeneity. In other words, if the targeting curve (RATE curve) is above the diagonal line, it suggests that there is heterogeneity in the treatment effect. And in terms of the AUTOC (Area Under the Targeting Operator Characteristic Curve) metric, a value significantly greater than 0 indicates the presence of heterogeneity.
+
+We use the `test_heterogeneity` function from the `mediaeffects` package to perform this test. The function takes in the outcome variable (Y), treatment variable (W), covariate matrix (X), and survey weights (if applicable) as inputs, and returns the RATE curve and AUTOC estimate.
+
+```{r test-heterogeneity, echo=TRUE}
+# Test for heterogeneity using RATE method
+het_test <- test_heterogeneity(
+  Y, W, X, 
+  weights = df_clean$wtssps
+)
+
+# Plot the targeting curve
+plot(het_test$rate, 
+     main = "Targeting Operator Characteristic")
+```
+
+We can see from the plot that the targeting curve is above the diagonal, indicating that there is heterogeneity in the effect of conservatism on Trump ratings.
+
+```{r autoc-estimate, echo=TRUE}
+# Print AUTOC estimate and 95% CI
+autoc_val <- round(het_test$autoc, 2)
+autoc_ci <- round(1.96 * het_test$std_err, 2)
+print(paste("AUTOC:", autoc_val, "+/-", autoc_ci))
+```
+
+The AUTOC is significantly greater than 0, indicating that there is significant heterogeneity in the effect of conservatism on Trump ratings. This suggests that the effect of conservatism on Trump ratings varies across individuals, and we can proceed to estimate the conditional average treatment effects (CATEs) for each individual.
+
+### Step 2: Individual level effects sizes
+
+We can estimate the CATEs for each individual using the `estimate_cates` function from the `mediaeffects` package. This function fits a causal forest model to the data and estimates the treatment effect for each individual based on their covariate values. In the context of this example, it provides an estimate of how much being conservative affects an individual's rating of Donald Trump, taking into account their unique characteristics. 
+
+We use the `estimate_cates` function to obtain the CATEs for all observations in our dataset. The function takes in the outcome variable (Y), treatment variable (W), covariate matrix (X), and survey weights (if applicable) as inputs, and returns the estimated CATEs along with the average treatment effect (ATE) and its standard error.
+
+```{r estimate-cates, echo=TRUE}
+# Estimate individual-level treatment effects (CATEs) using causal forest
+cate_results <- 
+  estimate_cates(
+    Y, W, X, 
+    ids = df_clean$id,
+    weights = df_clean$wtssps
+  )
+
+# Display first few CATE estimates
+cate_results$cates %>% head()
+
+# Merge CATE estimates into main dataframe
+df_clean <- 
+  inner_join(
+    df_clean,
+    cate_results$cates,
+    by = "id"
+  )
+```
+
+The causal forest model consists of multiple decision trees that are specifically designed to estimate the effect of conservatism on Trump ratings, while accounting for confounding variables. Each tree estimates the treatment effect for individuals based on their characteristics, and the final CATE for each individual is obtained by averaging the treatment effect estimates from all trees in the forest. It is possible to visualize any of the individual trees from the causal forest to understand how the model makes its predictions.
+
+```{r visualize-tree, echo=TRUE, fig.height=7}
+# Visualize a random tree
+tree_num <- sample(1:2000, 1)
+plot(get_tree(cate_results$causal_forest, tree_num))
+```
+
+
+Given that we have individual level effects, we can also report the average treatment effect (ATE) along with its 95% confidence interval, in line with traditional approaches.
+
+```{r ate-estimate, echo=TRUE}
+# Report ATE with 95% CI
+ate_val <- round(cate_results$ate, 2)
+ate_ci <- round(1.96 * cate_results$ate_se, 2)
+print(paste("ATE:", ate_val, "+/-", ate_ci))
+```
+
+
+We can also visualize the distribution of individual treatment effects using histograms and violin plots, stratified by quintiles of effect size. The default number of quantiles is 5 (quintiles), but this can be adjusted as needed. We use the `plot_treatment_effect_histogram` and `plot_treatment_effect_violin` functions from the `mediaeffects` package to create these visualizations.
+
+```{r plot-histogram, echo=TRUE, fig.width=7, fig.height=5}
+# Visualize distribution by quintile
+plot_treatment_effect_histogram(
+  df_clean, 
+  ate = cate_results$ate
+)
+```
+
+
+```{r plot-violin, echo=TRUE, fig.width=7, fig.height=5}
+# Show distribution within each quintile
+plot_treatment_effect_violin(
+  df_clean, 
+  ate = cate_results$ate
+)
+```
+
+
+### Step 3: Which covariates drive heterogeneity?
+
+Now that we have established that there is significant heterogeneity in the effect of conservatism on Trump ratings, and we have estimated individual-level treatment effects, we can explore which covariates are driving this heterogeneity. The `identify_moderators` function from the `mediaeffects` package helps us identify the most important moderators by calculating variable importance scores based on how much each covariate contributes to the heterogeneity in treatment effects.
+
+```{r identify-moderators, echo=TRUE}
+# Identify which covariates drive heterogeneity
+moderators <- identify_moderators(
+  cate_results$causal_forest, 
+  X
+)
+
+moderators$variable_importance
+```
+
+
+We can visualize the top moderators using a heatmap, which shows how the estimated treatment effects vary across different levels of the top moderators. We use the `plot_moderator_heatmap` function from the `mediaeffects` package to create this visualization.
+
+```{r plot-heatmap, echo=TRUE, fig.asp=1.75, fig.width=7}
+# Visualize top moderators across quintiles
+plot_moderator_heatmap(
+  df_clean, 
+  moderators$top_variables
+)
+```
+
+
+Likelihood to vote seems like a strong moderator of this effect in this example. This suggests that among conservatives, those who are more likely to vote in the 2024 elections tend to have higher ratings of Donald Trump compared to those who are less likely to vote. This finding highlights the importance of voter engagement in shaping political attitudes within ideological groups.
+
+
+## Verification phase
+
+Now that we have identified likely moderators of heterogeneity using causal forests, we can verify these findings using traditional subgroup analysis as well as with interaction terms in linear regression models. This helps to ensure that the results are robust and interpretable in a linear regression framework.
+
+First, we can look at subgroups by plotting Trump ratings by likelihood to vote among conservatives. We specifically focus on conservatives (treatment group) here to see how Trump ratings vary by likelihood to vote. We see that the subgroups who are more likely to vote tend to have higher Trump ratings.
+
+```{r plot-subgroups, echo=FALSE, fig.width=7, fig.height=5}
+# Verification: Examine Trump ratings by likelihood to vote among conservatives
+df_clean %>%
+  filter(conservative == 1) %>%
+  # recode likely to vote 1-5
+  mutate(
+    lkelyvot = case_when(
+      lkelyvot == 1 ~ "Very unlikely",
+      lkelyvot == 2 ~ "Unlikely",
+      lkelyvot == 3 ~ "Neither likely nor unlikely",
+      lkelyvot == 4 ~ "Likely",
+      lkelyvot == 5 ~ "Very likely",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c(
+      "Very unlikely", "Unlikely", "Neither likely nor unlikely", "Likely", "Very likely"))
+  ) %>% 
+  ggplot(aes(x = lkelyvot, y = rating_trump, fill = lkelyvot)) +
+  geom_boxplot(varwidth = TRUE, show.legend = F) +
+  scale_fill_brewer(palette = "RdYlGn") +
+  theme_bw() +
+  labs(x = "Likely to vote in 2024 elections", y = "Trump Rating", fill = "Likely to vote",
+       title = "Trump Support Among Conservatives") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Second, we can fit a linear regression model with an interaction term between conservatism and likelihood to vote. This allows us to formally test whether the effect of conservatism on Trump ratings varies by likelihood to vote.
+
+```{r regression-table, results='asis', echo=FALSE}
+# Verification: Test interaction effect using traditional linear regression
+df_clean %>%
+  lm_robust(
+    rating_trump ~ conservative * lkelyvot,
+    data = .,
+    weights = wtssps
+  ) %>% 
+  texreg(include.ci = F, digits = 3, caption = "Linear Regression with Interaction Term: Trump Ratings ~ Conservatism * Likelihood to Vote",
+         label = "tab:regression-interaction",
+         custom.coef.names = c("(Intercept)", "Conservative", "Likely to Vote", 
+                               "Conservative:Likely to Vote"))
+```
+
+The results show that the interaction terms between conservatism and likelihood to vote are statistically significant, indicating that the effect of conservatism on Trump ratings does indeed vary by likelihood to vote. Specifically, the positive coefficients for the interaction terms suggest that as individuals report being more likely to vote, the positive effect of conservatism on Trump ratings increases. This finding aligns with the results from the causal forest analysis, providing further evidence that likelihood to vote is an important moderator of the relationship between conservatism and support for Donald Trump.
+
+# Discussion
+
+The use of causal forests provides a powerful and flexible approach to exploring heterogeneity in treatment effects, overcoming many of the limitations associated with traditional methods. By allowing for the automatic identification of complex interactions and nonlinear relationships, causal forests enable researchers to uncover nuanced patterns of heterogeneity that may be missed by traditional approaches. The illustrative example using the 2024 GSS data demonstrates how causal forests can be applied to estimate individual-level treatment effects and identify key moderators driving heterogeneity.
+
+# References {-}
+
+
+
+
+
+
