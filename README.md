@@ -389,19 +389,9 @@ The package builds on these R packages:
 - `tidyverse` - Data manipulation and visualization
 
 
-
-## Authors
-
-- **Saurabh Khanna** ([ORCID: 0000-0002-9346-4896](https://orcid.org/0000-0002-9346-4896))  
-  Amsterdam School of Communication Research, University of Amsterdam
-
-- **Jochen Peter** ([ORCID: 0000-0002-2356-6619](https://orcid.org/0000-0002-2356-6619))  
-  Amsterdam School of Communication Research, University of Amsterdam
-
-
 ## Support
 
-For questions, bug reports, or feature requests, please [open an issue](https://github.com/skhanna/mediaeffects/issues) on GitHub.
+For questions, bug reports, or feature requests, please [open an issue](https://github.com/mediaeffects/mediaeffects/issues) on GitHub.
 
 ---
 
