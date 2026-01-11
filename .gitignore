@@ -39,11 +39,6 @@ cache/
 *.synctex.gz
 *-concordance.tex
 
-# JOSS paper build outputs (keep sources)
-paper/paper_files/
-paper/figure-*/
-paper/*.pdf
-
 # Misc
 .vscode/
 .idea/

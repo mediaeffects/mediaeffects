@@ -170,7 +170,7 @@ We now arrive at the central methodological innovation towards analyzing heterog
 
 Causal forests differ from regular random forests. In a standard random forest model used to predict support for Trump, each decision tree recursively partitions the feature space to form subsets of individuals who exhibit similar levels of Trump support. In contrast, in a causal forest, each tree recursively partitions the data to form subsets of individuals who exhibit similar estimated treatment effects. Consider a partition of the sample based on age. A standard (prediction-oriented) random forest addresses the question: “Does age improve my ability to predict Trump approval ratings?” In contrast, a causal forest addresses the question: “Does age help me identify subpopulations in which the effect of conservatism on Trump approval differs?” Thus, even if older and younger individuals exhibit similar average Trump approval levels, the causal forest may detect that conservatism increases Trump support more strongly among older individuals than among younger ones. This differential response represents the treatment effect heterogeneity that the causal forest is designed to uncover.
 
-### The honesty principle: Why we can trust the results
+### The honesty principle
 
 A central methodological challenge arises when machine learning algorithms are applied to empirical data to uncover patterns: there is a substantial risk of what computer scientists call **overfitting** - a situation where the algorithm captures idiosyncratic noise rather than underlying systematic relationships. An overfitted model may appear to perform well on the already seen training data but fails to generalize to new, unseen data. An example of overfitting would be if a model learned that individuals who attended political rallies expressed higher support for Trump, but this pattern was merely a random artifact of the specific sample rather than a true underlying relationship. This issue is particularly problematic in the context of estimating treatment effects, where the objective is to support credible statistical inference, rather than mere prediction.
 
@@ -391,7 +391,7 @@ df_clean %>% head()
 
 The resulting dataset includes a `treatment_effect` variable for each observation, representing the estimated individual-level effect of conservatism on Trump support, accompanied by corresponding confidence intervals. Additionally, the `quintile` variable partitions respondents into five groups based on the magnitude of their estimated treatment effects, from the smallest (quintile 1) to the largest (quintile 5).
 
-To gain intuition about the underlying model, we can even visualize a single decision tree from the fitted forest. Each path from the root node to a terminal node (leaf) captures a distinct "type" of respondent, defined by particular combinations of their covariate values. Each leaf reports the mean Trump rating and the proportion of conservatives among individuals assigned to that leaf, thereby illustrating how the model's predicted outcomes vary across different subpopulations.
+To gain intuition about the underlying model, we can programmatically visualize a randomly chosen decision tree from the fitted forest (Figure 4 ahead). Each path from the root node to a terminal node (leaf) captures a distinct "type" of respondent, defined by particular combinations of their covariate values. Each leaf reports the mean Trump rating and the proportion of conservatives among individuals assigned to that leaf, thereby illustrating how the model's predicted outcomes vary across different subpopulations.
 
 
 ``` r
@@ -417,7 +417,7 @@ print(paste("ATE:", ate_val, "+/-", ate_ci))
 ```
 
 
-However, this global estimate masks substantial heterogeneity in treatment effects. To characterize this heterogeneity, we examine the full distribution of estimated individual-level effects. The histogram of CATEs reveals that the estimated treatment effects span a wide range from values close to zero (indicating that conservatism has minimal impact on Trump ratings for some individuals) to values exceeding 60 points (indicating a substantial increase in support for others). The dashed vertical line represents the average treatment effect (ATE) of approximately 30 points.
+However, this global estimate masks substantial heterogeneity in treatment effects. To characterize this heterogeneity, we examine the full distribution of estimated individual-level effects (Figure 5). The histogram of CATEs reveals that the estimated treatment effects span a wide range from values close to zero (indicating that conservatism has minimal impact on Trump ratings for some individuals) to values exceeding 60 points (indicating a substantial increase in support for others). The dashed vertical line represents the average treatment effect (ATE) of approximately 30 points.
 
 
 
@@ -431,7 +431,7 @@ plot_treatment_effect_histogram(
 
 ![Histogram of estimated individual-level treatment effects (CATEs) with average treatment effect (ATE) indicated by dashed line.](paper_files/figure-latex/plot-histogram-1.pdf) 
 
-The violin plot further disaggregates this distribution by quintiles of the estimated treatment effect. In quintile 1 (the group with the lowest estimated effects), treatment effects are concentrated near zero, suggesting little impact of conservatism on Trump evaluations. In contrast, quintile 5 (the group with the highest estimated effects) displays treatment effects largely concentrated around 50–60 points, indicating that for this subgroup, conservatism is strongly associated with elevated Trump support.
+The violin plot further in figure 6 disaggregates this distribution by quintiles of the estimated treatment effect. In quintile 1 (the group with the lowest estimated effects), treatment effects are concentrated near zero, suggesting little impact of conservatism on Trump evaluations. In contrast, quintile 5 (the group with the highest estimated effects) displays treatment effects largely concentrated around 50–60 points, indicating that for this subgroup, conservatism is strongly associated with elevated Trump support.
 
 
 ``` r
@@ -478,7 +478,7 @@ moderators$variable_importance
 ## # i 21 more rows
 ```
 
-The most influential moderator is `lkelyvot` (likelihood of voting), followed by `income16` (family income) and `educ` (educational attainment). This indicates that the moderating effect of conservatism on support for Trump is most strongly conditioned by an individual’s propensity to vote. To further understand these patterns, we construct a heatmap using `plot_moderator_heatmap()` that displays the association between each covariate and the quintiles of the estimated treatment effects.
+The most influential moderator is `lkelyvot` (likelihood of voting), followed by `income16` (family income) and `educ` (educational attainment). This indicates that the moderating effect of conservatism on support for Trump is most strongly conditioned by an individual’s propensity to vote. To further understand these patterns, we construct a heatmap using `plot_moderator_heatmap` that displays the association between each covariate and the quintiles of the estimated treatment effects (see Figure 7).
 
 
 ``` r
@@ -489,7 +489,7 @@ plot_moderator_heatmap(
 )
 ```
 
-![Heatmap showing standardized mean values of top moderators across treatment-effect quintiles.](paper_files/figure-latex/plot-heatmap-1.pdf) 
+![Standardized mean values of top moderators across treatment-effect quintiles.](paper_files/figure-latex/plot-heatmap-1.pdf) 
 
 Each row in the heatmap corresponds to a covariate, and each column corresponds to a treatment-effect quintile (1 = lowest, 5 = highest). The values represent standardized mean values of each covariate within each quintile, with colors indicating deviation of each covariate from the overall sample mean. Here, positive values (green) indicate above-average levels, whereas negative values (red) indicate below-average levels. Inspection of the top row (`lkelyvot`) confirms a systematic pattern: individuals in the lowest treatment-effect quintile exhibit a *below-average* likelihood of voting (−1.7), tend to have lower family income, less education, work in less prestigious jobs, and are likely to be younger and not white. On the other hand, individuals in the highest treatment-effect quintile exhibit an *above-average* likelihood of voting (+0.72), earn more, are well educated, older, and more lilely to be white. This pattern suggests that the effect of conservatism on Trump support is particularly pronounced among individuals who are more politically engaged and socioeconomically advantaged.
 
